@@ -27,6 +27,7 @@ use MediaWiki\Title\Title;
 use Psr\Log\LoggerAwareInterface;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
+use RuntimeException;
 
 /**
  * Class to handle multiple HTTP requests
@@ -106,7 +107,7 @@ class MultiHttpClient implements LoggerAwareInterface {
 		$qicVersion = \ExtensionRegistry::getInstance()->getAllThings()['QuickInstantCommons']['version'];
 		$this->userAgent = 'QuickInstantCommons/' . $qicVersion .
 			' MediaWiki/' . MW_VERSION . ' ' . rawurlencode( $wgSitename ) .
-			' (' . Title::newMainPage()->getCanonicalUrl() . ')';
+			' (' . "https://miraheze.org; tech@miraheze.org" . ')';
 		if ( isset( $options['caBundlePath'] ) ) {
 			$this->caBundlePath = $options['caBundlePath'];
 			if ( !file_exists( $this->caBundlePath ) ) {
@@ -288,25 +289,41 @@ class MultiHttpClient implements LoggerAwareInterface {
 		// Execute the cURL handles concurrently...
 		$active = null; // handles still being processed
 		do {
-			// Send/recieve all pending data. e.g. read responses.
-			do {
-				$mrc = curl_multi_exec( $this->cmh, $active );
-				// A request probably completed, so read its info.
-				$info = curl_multi_info_read( $this->cmh );
-				if ( $info !== false ) {
-					$infos[(int)$info['handle']] = $info;
-				}
-			// In old versions of curl, we had to loop this. Should not matter in new versions.
-			} while ( $mrc == CURLM_CALL_MULTI_PERFORM );
+			// Do any available work...
+			$mrc = curl_multi_exec( $this->cmh, $active );
+
+			if ( $mrc !== CURLM_OK ) {
+				$error = curl_multi_strerror( $mrc );
+				$this->logger->error( 'curl_multi_exec() failed: {error}', [
+					'error' => $error,
+					'exception' => new RuntimeException(),
+					'method' => $caller,
+				] );
+				break;
+			}
 
 			// Wait (if possible) for available work...
-			if ( $active > 0 && $mrc == CURLM_OK && curl_multi_select( $this->cmh, $selectTimeout ) == -1 ) {
-				// This bug should be fixed now in theory!
-				// So we should not reach this code unless we hit the select timeout.
-				// PHP bug 63411; https://curl.haxx.se/libcurl/c/curl_multi_fdset.html
-				usleep( 5000 ); // 5ms
+			if ( $active > 0 && curl_multi_select( $this->cmh, $selectTimeout ) === -1 ) {
+				$errno = curl_multi_errno( $this->cmh );
+				$error = curl_multi_strerror( $errno );
+				$this->logger->error( 'curl_multi_select() failed: {error}', [
+					'error' => $error,
+					'exception' => new RuntimeException(),
+					'method' => $caller,
+				] );
 			}
-		} while ( $active > 0 && $mrc == CURLM_OK );
+		} while ( $active > 0 );
+
+		$queuedMessages = null;
+		do {
+			$info = curl_multi_info_read( $this->cmh, $queuedMessages );
+			if ( $info !== false && $info['msg'] === CURLMSG_DONE ) {
+				// Note: cast to integer even works on PHP 8.0+ despite the
+				// handle being an object not a resource, because CurlHandle
+				// has a backwards-compatible cast_object handler.
+				$infos[(int)$info['handle']] = $info;
+			}
+		} while ( $queuedMessages > 0 );
 
 		// Make sure we got them all.
 		$info = false;
@@ -321,6 +338,7 @@ class MultiHttpClient implements LoggerAwareInterface {
 		foreach ( $reqs as $index => &$req ) {
 			$ch = $this->handles[$index];
 			curl_multi_remove_handle( $this->cmh, $ch );
+
 			if ( isset( $infos[(int)$ch] ) ) {
 				$info = $infos[(int)$ch];
 				$errno = $info['result'];
@@ -329,9 +347,12 @@ class MultiHttpClient implements LoggerAwareInterface {
 					if ( function_exists( 'curl_strerror' ) ) {
 						$req['response']['error'] .= " " . curl_strerror( $errno );
 					}
-					// @phan-suppress-next-line PhanTypeConversionFromArray
-					$this->logger->warning( "Error fetching URL \"" . $req['url'] . "\": " .
-						$req['response']['error'] );
+					$this->logger->error( 'Error fetching URL "{url}": {error}', [
+						'url' => $req['url'],
+						'error' => $req['response']['error'],
+						'exception' => new RuntimeException(),
+						'method' => $caller,
+					] );
 				} else {
 					$this->logger->debug(
 						"HTTP complete: {method} {url} code={response_code} size={size} " .
@@ -354,7 +375,7 @@ class MultiHttpClient implements LoggerAwareInterface {
 				$req['response']['error'] = "(curl error: no status set)";
 			}
 
-			// For convenience with the list() operator
+			// For convenience with array destructuring
 			$req['response'][0] = $req['response']['code'];
 			$req['response'][1] = $req['response']['reason'];
 			$req['response'][2] = $req['response']['headers'];
@@ -363,8 +384,6 @@ class MultiHttpClient implements LoggerAwareInterface {
 			if ( !$this->curlHandleCache ) {
 				// reuse the handle
 				$this->curlHandleCache = $ch;
-			} else {
-				curl_close( $ch );
 			}
 		}
 		$this->handles = [];
