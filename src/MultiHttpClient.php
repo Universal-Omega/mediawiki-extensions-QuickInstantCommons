@@ -645,5 +645,8 @@ class MultiHttpClient implements LoggerAwareInterface {
 		if ( $this->cmh ) {
 			curl_multi_close( $this->cmh );
 		}
+		if ( $this->curlHandleCache ) {
+			$this->cmh = null;
+		}
 	}
 }
