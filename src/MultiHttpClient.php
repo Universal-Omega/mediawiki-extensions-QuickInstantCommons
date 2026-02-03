@@ -186,7 +186,7 @@ class MultiHttpClient implements LoggerAwareInterface {
 
 		if ( $this->isCurlEnabled() ) {
 			$this->runMultiCurl( $reqs );
-			return $this->runMultiCurlFinish( $reqs );
+			return $this->runMultiCurlFinish( $reqs, __METHOD__ );
 		} else {
 			throw new LogicException( "Curl php extension needs to be installed" );
 		}
@@ -223,7 +223,7 @@ class MultiHttpClient implements LoggerAwareInterface {
 			throw new LogicException( "Not in an async request!" );
 		}
 
-		$res = $this->runMultiCurlFinish( $this->inFlightState );
+		$res = $this->runMultiCurlFinish( $this->inFlightState, __METHOD__ );
 		$this->inFlightState = null;
 		return $res;
 	}
@@ -280,10 +280,11 @@ class MultiHttpClient implements LoggerAwareInterface {
 	 * Complete all the queued up requests
 	 *
 	 * @param array &$reqs
+	 * @param string $caller The method making these requests, for attribution in logs
 	 * @return array List of requests and their results
 	 * @suppress PhanTypeInvalidDimOffset
 	 */
-	private function runMultiCurlFinish( array &$reqs ) {
+	private function runMultiCurlFinish( array &$reqs, string $caller ) {
 		$selectTimeout = $this->getSelectTimeout();
 		$infos = [];
 		// Execute the cURL handles concurrently...
@@ -511,14 +512,31 @@ class MultiHttpClient implements LoggerAwareInterface {
 			// request batches to the same host can avoid having to keep making connections
 			curl_multi_setopt( $cmh, CURLMOPT_MAXCONNECTS, (int)$this->maxConnsPerHost );
 			$this->cmh = $cmh;
+		}
 
-			// CURLMOPT_MAX_HOST_CONNECTIONS is available since PHP 7.0.7 and cURL 7.30.0
-			if ( version_compare( curl_version()['version'], '7.30.0', '>=' ) ) {
-				// Limit the number of in-flight requests for any given host
-				$maxHostConns = $this->maxConnsPerHost;
-				curl_multi_setopt( $this->cmh, CURLMOPT_MAX_HOST_CONNECTIONS, $this->maxConnsPerHost );
+		$curlVersion = curl_version()['version'];
+
+		// CURLMOPT_MAX_HOST_CONNECTIONS is available since PHP 7.0.7 and cURL 7.30.0
+		if ( version_compare( $curlVersion, '7.30.0', '>=' ) ) {
+			// Limit the number of in-flight requests for any given host
+			$maxHostConns = $this->maxConnsPerHost;
+			curl_multi_setopt( $this->cmh, CURLMOPT_MAX_HOST_CONNECTIONS, (int)$maxHostConns );
+		}
+
+		if ( $this->usePipelining ) {
+			if ( version_compare( $curlVersion, '7.43', '<' ) ) {
+				// The option is a boolean
+				$pipelining = 1;
+			} elseif ( version_compare( $curlVersion, '7.62', '<' ) ) {
+				// The option is a bitfield and HTTP/1.x pipelining is supported
+				$pipelining = CURLPIPE_HTTP1 | CURLPIPE_MULTIPLEX;
+			} else {
+				// The option is a bitfield but HTTP/1.x pipelining has been removed
+				$pipelining = CURLPIPE_MULTIPLEX;
 			}
-			curl_multi_setopt( $this->cmh, CURLMOPT_PIPELINING, $this->usePipelining ? CURLPIPE_MULTIPLEX : 0 );
+			// Suppress deprecation, we know already (T264735)
+			// phpcs:ignore Generic.PHP.NoSilencedErrors
+			@curl_multi_setopt( $this->cmh, CURLMOPT_PIPELINING, $pipelining );
 		}
 
 		return $this->cmh;
@@ -626,9 +644,6 @@ class MultiHttpClient implements LoggerAwareInterface {
 		}
 		if ( $this->cmh ) {
 			curl_multi_close( $this->cmh );
-		}
-		if ( $this->curlHandleCache ) {
-			curl_close( $this->curlHandleCache );
 		}
 	}
 }
