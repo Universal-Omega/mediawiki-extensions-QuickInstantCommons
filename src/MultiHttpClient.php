@@ -27,6 +27,7 @@ use MediaWiki\Title\Title;
 use Psr\Log\LoggerAwareInterface;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
+use RuntimeException;
 
 /**
  * Class to handle multiple HTTP requests
@@ -106,7 +107,7 @@ class MultiHttpClient implements LoggerAwareInterface {
 		$qicVersion = \ExtensionRegistry::getInstance()->getAllThings()['QuickInstantCommons']['version'];
 		$this->userAgent = 'QuickInstantCommons/' . $qicVersion .
 			' MediaWiki/' . MW_VERSION . ' ' . rawurlencode( $wgSitename ) .
-			' (' . Title::newMainPage()->getCanonicalUrl() . ')';
+			' (' . "https://miraheze.org; tech@miraheze.org" . ')';
 		if ( isset( $options['caBundlePath'] ) ) {
 			$this->caBundlePath = $options['caBundlePath'];
 			if ( !file_exists( $this->caBundlePath ) ) {
@@ -185,7 +186,7 @@ class MultiHttpClient implements LoggerAwareInterface {
 
 		if ( $this->isCurlEnabled() ) {
 			$this->runMultiCurl( $reqs );
-			return $this->runMultiCurlFinish( $reqs );
+			return $this->runMultiCurlFinish( $reqs, __METHOD__ );
 		} else {
 			throw new LogicException( "Curl php extension needs to be installed" );
 		}
@@ -222,7 +223,7 @@ class MultiHttpClient implements LoggerAwareInterface {
 			throw new LogicException( "Not in an async request!" );
 		}
 
-		$res = $this->runMultiCurlFinish( $this->inFlightState );
+		$res = $this->runMultiCurlFinish( $this->inFlightState, __METHOD__ );
 		$this->inFlightState = null;
 		return $res;
 	}
@@ -279,34 +280,51 @@ class MultiHttpClient implements LoggerAwareInterface {
 	 * Complete all the queued up requests
 	 *
 	 * @param array &$reqs
+	 * @param string $caller The method making these requests, for attribution in logs
 	 * @return array List of requests and their results
 	 * @suppress PhanTypeInvalidDimOffset
 	 */
-	private function runMultiCurlFinish( array &$reqs ) {
+	private function runMultiCurlFinish( array &$reqs, string $caller ) {
 		$selectTimeout = $this->getSelectTimeout();
 		$infos = [];
 		// Execute the cURL handles concurrently...
 		$active = null; // handles still being processed
 		do {
-			// Send/recieve all pending data. e.g. read responses.
-			do {
-				$mrc = curl_multi_exec( $this->cmh, $active );
-				// A request probably completed, so read its info.
-				$info = curl_multi_info_read( $this->cmh );
-				if ( $info !== false ) {
-					$infos[(int)$info['handle']] = $info;
-				}
-			// In old versions of curl, we had to loop this. Should not matter in new versions.
-			} while ( $mrc == CURLM_CALL_MULTI_PERFORM );
+			// Do any available work...
+			$mrc = curl_multi_exec( $this->cmh, $active );
+
+			if ( $mrc !== CURLM_OK ) {
+				$error = curl_multi_strerror( $mrc );
+				$this->logger->error( 'curl_multi_exec() failed: {error}', [
+					'error' => $error,
+					'exception' => new RuntimeException(),
+					'method' => $caller,
+				] );
+				break;
+			}
 
 			// Wait (if possible) for available work...
-			if ( $active > 0 && $mrc == CURLM_OK && curl_multi_select( $this->cmh, $selectTimeout ) == -1 ) {
-				// This bug should be fixed now in theory!
-				// So we should not reach this code unless we hit the select timeout.
-				// PHP bug 63411; https://curl.haxx.se/libcurl/c/curl_multi_fdset.html
-				usleep( 5000 ); // 5ms
+			if ( $active > 0 && curl_multi_select( $this->cmh, $selectTimeout ) === -1 ) {
+				$errno = curl_multi_errno( $this->cmh );
+				$error = curl_multi_strerror( $errno );
+				$this->logger->error( 'curl_multi_select() failed: {error}', [
+					'error' => $error,
+					'exception' => new RuntimeException(),
+					'method' => $caller,
+				] );
 			}
-		} while ( $active > 0 && $mrc == CURLM_OK );
+		} while ( $active > 0 );
+
+		$queuedMessages = null;
+		do {
+			$info = curl_multi_info_read( $this->cmh, $queuedMessages );
+			if ( $info !== false && $info['msg'] === CURLMSG_DONE ) {
+				// Note: cast to integer even works on PHP 8.0+ despite the
+				// handle being an object not a resource, because CurlHandle
+				// has a backwards-compatible cast_object handler.
+				$infos[(int)$info['handle']] = $info;
+			}
+		} while ( $queuedMessages > 0 );
 
 		// Make sure we got them all.
 		$info = false;
@@ -321,6 +339,7 @@ class MultiHttpClient implements LoggerAwareInterface {
 		foreach ( $reqs as $index => &$req ) {
 			$ch = $this->handles[$index];
 			curl_multi_remove_handle( $this->cmh, $ch );
+
 			if ( isset( $infos[(int)$ch] ) ) {
 				$info = $infos[(int)$ch];
 				$errno = $info['result'];
@@ -329,9 +348,12 @@ class MultiHttpClient implements LoggerAwareInterface {
 					if ( function_exists( 'curl_strerror' ) ) {
 						$req['response']['error'] .= " " . curl_strerror( $errno );
 					}
-					// @phan-suppress-next-line PhanTypeConversionFromArray
-					$this->logger->warning( "Error fetching URL \"" . $req['url'] . "\": " .
-						$req['response']['error'] );
+					$this->logger->error( 'Error fetching URL "{url}": {error}', [
+						'url' => $req['url'],
+						'error' => $req['response']['error'],
+						'exception' => new RuntimeException(),
+						'method' => $caller,
+					] );
 				} else {
 					$this->logger->debug(
 						"HTTP complete: {method} {url} code={response_code} size={size} " .
@@ -354,7 +376,7 @@ class MultiHttpClient implements LoggerAwareInterface {
 				$req['response']['error'] = "(curl error: no status set)";
 			}
 
-			// For convenience with the list() operator
+			// For convenience with array destructuring
 			$req['response'][0] = $req['response']['code'];
 			$req['response'][1] = $req['response']['reason'];
 			$req['response'][2] = $req['response']['headers'];
@@ -363,8 +385,6 @@ class MultiHttpClient implements LoggerAwareInterface {
 			if ( !$this->curlHandleCache ) {
 				// reuse the handle
 				$this->curlHandleCache = $ch;
-			} else {
-				curl_close( $ch );
 			}
 		}
 		$this->handles = [];
@@ -492,14 +512,31 @@ class MultiHttpClient implements LoggerAwareInterface {
 			// request batches to the same host can avoid having to keep making connections
 			curl_multi_setopt( $cmh, CURLMOPT_MAXCONNECTS, (int)$this->maxConnsPerHost );
 			$this->cmh = $cmh;
+		}
 
-			// CURLMOPT_MAX_HOST_CONNECTIONS is available since PHP 7.0.7 and cURL 7.30.0
-			if ( version_compare( curl_version()['version'], '7.30.0', '>=' ) ) {
-				// Limit the number of in-flight requests for any given host
-				$maxHostConns = $this->maxConnsPerHost;
-				curl_multi_setopt( $this->cmh, CURLMOPT_MAX_HOST_CONNECTIONS, $this->maxConnsPerHost );
+		$curlVersion = curl_version()['version'];
+
+		// CURLMOPT_MAX_HOST_CONNECTIONS is available since PHP 7.0.7 and cURL 7.30.0
+		if ( version_compare( $curlVersion, '7.30.0', '>=' ) ) {
+			// Limit the number of in-flight requests for any given host
+			$maxHostConns = $this->maxConnsPerHost;
+			curl_multi_setopt( $this->cmh, CURLMOPT_MAX_HOST_CONNECTIONS, (int)$maxHostConns );
+		}
+
+		if ( $this->usePipelining ) {
+			if ( version_compare( $curlVersion, '7.43', '<' ) ) {
+				// The option is a boolean
+				$pipelining = 1;
+			} elseif ( version_compare( $curlVersion, '7.62', '<' ) ) {
+				// The option is a bitfield and HTTP/1.x pipelining is supported
+				$pipelining = CURLPIPE_HTTP1 | CURLPIPE_MULTIPLEX;
+			} else {
+				// The option is a bitfield but HTTP/1.x pipelining has been removed
+				$pipelining = CURLPIPE_MULTIPLEX;
 			}
-			curl_multi_setopt( $this->cmh, CURLMOPT_PIPELINING, $this->usePipelining ? CURLPIPE_MULTIPLEX : 0 );
+			// Suppress deprecation, we know already (T264735)
+			// phpcs:ignore Generic.PHP.NoSilencedErrors
+			@curl_multi_setopt( $this->cmh, CURLMOPT_PIPELINING, $pipelining );
 		}
 
 		return $this->cmh;
@@ -609,7 +646,7 @@ class MultiHttpClient implements LoggerAwareInterface {
 			curl_multi_close( $this->cmh );
 		}
 		if ( $this->curlHandleCache ) {
-			curl_close( $this->curlHandleCache );
+			$this->curlHandleCache = null;
 		}
 	}
 }
